@@ -1,114 +1,137 @@
-# Fuentes (catálogo)
+# Fuentes de Datos — Estado Transparente
 
-Este archivo define fuentes de datos públicos y sus reglas de ingesta/parsing.
+Este archivo define las fuentes de datos oficiales y sus reglas de ingesta/parsing.
 
-## Fuentes Implementadas
+---
 
-### 1. Demo: Presupuesto por Ministerio
+## Fuente MVP: Ley de Presupuestos 2026 (DIPRES)
+
+### Identificación
 
 | Campo | Valor |
 |-------|-------|
-| **source_id** | `demo-presupuesto` |
+| **source_id** | `dipres-ley-presupuestos-2026` |
 | **Tipo** | CSV |
-| **URL** | Local: `data/demo_presupuesto.csv` |
-| **Frecuencia** | Manual (demo) |
-| **Parser** | `csv_parser_v1` |
-| **Métrica** | `monto` → Monto asignado |
+| **URL** | https://www.dipres.gob.cl/597/articles-397499_doc_csv.csv |
+| **Frecuencia** | Anual (publicación de Ley de Presupuestos) |
+| **Parser** | `dipres_ley_csv_v1` |
 
-**Columnas:**
-- `entidad`: Nombre del organismo
-- `categoria`: Personal, Operaciones, Inversión
-- `anio`: Año del presupuesto
-- `monto`: Monto en CLP
+### Descripción
 
-**Comando de ingesta:**
+**Resumen Presupuesto de Partida [Pesos]** — Ley de Presupuestos del Sector Público, Año Fiscal 2026.
+
+Archivo CSV oficial publicado por la Dirección de Presupuestos (DIPRES) del Ministerio de Hacienda de Chile.
+
+### Estructura del CSV
+
+| Columna | Tipo | Descripción |
+|---------|------|-------------|
+| Partida | TEXT | Código de partida presupuestaria (ministerio/servicio) |
+| Capitulo | TEXT | Código de capítulo |
+| Programa | TEXT | Código de programa |
+| Subtitulo | TEXT | Clasificación económica del gasto/ingreso |
+| Ítem | TEXT | Detalle del ítem presupuestario |
+| Asignacion | TEXT | Código de asignación específica |
+| Denominacion | TEXT | Nombre descriptivo del concepto |
+| Monto Pesos | NUMBER | Monto en pesos chilenos (CLP), miles de pesos |
+| Monto Dolar | NUMBER | Monto en dólares (USD) |
+
+**Delimitador:** `;` (punto y coma)
+**Encoding:** UTF-8 con BOM
+**Tamaño:** ~792 KB (~4,500 líneas)
+
+### Justificación de Estabilidad
+
+1. **URL permanente**: El patrón `articles-XXXXXX_doc_csv.csv` es usado consistentemente por DIPRES desde 2009 para todos los documentos de Ley de Presupuestos.
+
+2. **Publicación oficial**: Forma parte de la [Ley de Presupuestos](https://www.dipres.gob.cl/597/w3-multipropertyvalues-15145-37782.html), documento legal de publicación obligatoria por el Estado de Chile.
+
+3. **Sin autenticación**: Acceso público directo, sin login, cookies ni API keys.
+
+4. **Estructura estable**: El formato de 9 columnas se mantiene consistente entre años fiscales (verificado 2020-2026).
+
+5. **Metadatos verificables**:
+   ```
+   HTTP/1.1 200 OK
+   Content-Type: text/csv
+   Last-Modified: Tue, 16 Dec 2025 15:35:10 GMT
+   Content-Length: 792627
+   ```
+
+### Mapeo a Modelo de Datos
+
+| Campo CSV | Campo Fact | Transformación |
+|-----------|------------|----------------|
+| Partida | entity_key | Código numérico (ej: "01") |
+| Denominacion (primera ocurrencia por Partida) | entity_name | Texto descriptivo |
+| "2026" | period_start | 2026-01-01 |
+| "2026" | period_end | 2026-12-31 |
+| SUM(Monto Pesos) por Partida | value_num | Agregación |
+| Subtitulo | dims.subtitulo | Clasificación económica |
+| — | metric_key | `presupuesto_ley` |
+| — | unit | `CLP` |
+
+### Verificación Manual
+
 ```bash
-# Desde la raíz del proyecto
-cargo run --bin collector -- \
-  --source-id demo-presupuesto \
-  --url "file://$(pwd)/data/demo_presupuesto.csv"
+# 1. Verificar disponibilidad
+curl -sI "https://www.dipres.gob.cl/597/articles-397499_doc_csv.csv" | grep -E "HTTP|Content-Type|Last-Modified"
+
+# 2. Descargar y contar líneas
+curl -s "https://www.dipres.gob.cl/597/articles-397499_doc_csv.csv" | wc -l
+
+# 3. Ver estructura (primeras 5 líneas)
+curl -s "https://www.dipres.gob.cl/597/articles-397499_doc_csv.csv" | head -5
+
+# 4. Verificar hash
+curl -s "https://www.dipres.gob.cl/597/articles-397499_doc_csv.csv" | sha256sum
 ```
 
----
+### Referencias Oficiales
 
-## Fuentes Planificadas
-
-### 2. DIPRES - Presupuesto de la Nación
-
-| Campo | Valor |
-|-------|-------|
-| **source_id** | `dipres-presupuesto` |
-| **Tipo** | PDF / Excel |
-| **URL** | https://www.dipres.gob.cl/... |
-| **Frecuencia** | Anual |
-| **Parser** | `dipres_parser_v1` (pendiente) |
-
-### 3. ChileCompra - Órdenes de Compra
-
-| Campo | Valor |
-|-------|-------|
-| **source_id** | `chilecompra-ordenes` |
-| **Tipo** | CSV / API |
-| **URL** | https://www.mercadopublico.cl/... |
-| **Frecuencia** | Diaria |
-| **Parser** | `chilecompra_parser_v1` (pendiente) |
-
-### 4. Contraloría - Remuneraciones
-
-| Campo | Valor |
-|-------|-------|
-| **source_id** | `contraloria-remuneraciones` |
-| **Tipo** | CSV |
-| **URL** | https://www.contraloria.cl/... |
-| **Frecuencia** | Mensual |
-| **Parser** | `contraloria_parser_v1` (pendiente) |
+- [Portal de Datos Abiertos DIPRES](https://www.dipres.gob.cl/598/w3-propertyvalue-24024.html)
+- [Ley de Presupuestos 2026](https://www.dipres.gob.cl/597/w3-multipropertyvalues-15145-37782.html)
+- [Estadísticas DIPRES](https://www.dipres.gob.cl/598/w3-propertyname-706.html)
 
 ---
 
-## Proceso de Adición de Fuentes
+## Fuentes Descartadas para MVP
 
-1. **Identificar fuente pública**
-   - Verificar que los datos son públicos
-   - Documentar URL y formato
-   - Verificar frecuencia de actualización
+Las siguientes fuentes se evaluaron pero **no cumplen los criterios** de estabilidad para el MVP:
 
-2. **Crear parser determinista**
-   - Implementar en `services/parser/src/parsers/`
-   - Asegurar que mismo input = mismo output
-   - Agregar tests
+| Fuente | Razón de exclusión |
+|--------|-------------------|
+| ChileCompra | Requiere API con autenticación |
+| Contraloría | Solo PDF, sin CSV público estable |
+| DIPRES Ejecución Mensual | Formato XLS con headers no estándar (títulos en lugar de columnas) |
+| datos.gob.cl | API REST, no descarga directa de CSV |
+| DIPRES artículos XLS genéricos | Estructura variable entre archivos |
 
-3. **Documentar aquí**
-   - source_id único
-   - Todas las columnas/campos
-   - Comando de ingesta
+---
 
-4. **Probar pipeline completo**
-   ```bash
-   # Collector
-   cargo run --bin collector -- --source-id X --url "..."
+## Criterios de Inclusión de Fuentes
 
-   # Parser
-   cargo run --bin parser -- --artifact-id <UUID>
+Para agregar una nueva fuente, debe cumplir **todos** estos criterios:
 
-   # Verificar en API
-   curl http://localhost:8080/facts
-   ```
+1. **Formato**: CSV o formato tabular con estructura predecible
+2. **Acceso**: URL pública directa, sin autenticación
+3. **Estabilidad**: URL verificada funcionando por al menos 1 año
+4. **Estructura**: Columnas documentadas y consistentes
+5. **Mapeo**: Correspondencia clara con el modelo de datos (entity, metric, period, value)
+6. **Determinismo**: Mismo archivo = mismo output de parser
+
+Si existe ambigüedad en cualquiera de estos criterios, la fuente **no se implementa** hasta resolverla.
 
 ---
 
 ## Notas Legales
 
-- Solo se ingestan datos de **fuentes públicas oficiales**
+- Solo se ingestan datos de **fuentes públicas oficiales del Estado de Chile**
 - Se respeta el `robots.txt` de cada sitio
-- Rate limit mínimo de 1 segundo entre requests
-- Los artifacts se almacenan con hash verificable
-- La URL original siempre se preserva para auditoría
+- Los artifacts se almacenan con hash SHA-256 verificable
+- La URL original siempre se preserva para auditoría y trazabilidad
+- Este proyecto no tiene afiliación oficial con DIPRES ni el Gobierno de Chile
 
 ---
 
-## Contacto para Nuevas Fuentes
-
-Si conoces una fuente de datos públicos que debería incluirse:
-1. Abre un issue en GitHub
-2. Incluye: URL, formato, frecuencia de actualización
-3. Verificaremos que sea datos públicos
+*Última actualización: 2026-01-21*
