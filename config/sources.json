@@ -1,39 +1,47 @@
 {
-  "version": "1.1",
+  "version": "1.2",
   "description": "Fuentes oficiales de datos fiscales chilenos - Solo URLs verificadas",
   "sources": [
     {
-      "id": "dipres-presupuesto-ley-2024",
-      "name": "Ley de Presupuestos 2024 - DIPRES",
-      "description": "Presupuesto aprobado por ley para el año fiscal 2024",
+      "id": "dipres-ley-presupuestos-2026",
+      "name": "Ley de Presupuestos 2026 - DIPRES",
+      "description": "Resumen Presupuesto de Partida - Ley de Presupuestos del Sector Público, Año Fiscal 2026",
       "provider": "Dirección de Presupuestos (DIPRES)",
       "provider_url": "https://www.dipres.gob.cl",
       "category": "presupuesto",
-      "format": "xls",
+      "format": "csv",
       "frequency": "annual",
       "urls": [
         {
-          "year": 2024,
-          "url": "https://www.dipres.gob.cl/597/articles-315478_doc_xls.xls",
-          "description": "Ley de Presupuestos 2024 - Archivo Excel verificado"
+          "year": 2026,
+          "url": "https://www.dipres.gob.cl/597/articles-397499_doc_csv.csv",
+          "description": "Resumen Presupuesto de Partida [Pesos] - CSV oficial"
         }
       ],
-      "parser": "dipres_presupuesto",
+      "parser": "dipres_ley_csv_v1",
       "enabled": true,
       "verified": true,
       "verified_date": "2026-01-21",
-      "notes": "URL confirmada, descarga 7680 bytes"
+      "notes": "URL confirmada, ~792KB, delimitador ;, 9 columnas"
     }
   ],
   "parsers": {
-    "dipres_presupuesto": {
-      "type": "xls",
-      "columns": {
-        "entity": ["partida", "capitulo", "programa"],
-        "year": ["anio", "año"],
-        "amount": ["monto_ley", "presupuesto_inicial", "ppto_inicial"],
-        "category": ["subtitulo", "item", "asignacion"]
-      },
+    "dipres_ley_csv_v1": {
+      "type": "csv",
+      "delimiter": ";",
+      "encoding": "utf-8-bom",
+      "columns": [
+        "Partida",
+        "Capitulo",
+        "Programa",
+        "Subtitulo",
+        "Ítem",
+        "Asignacion",
+        "Denominacion",
+        "Monto Pesos",
+        "Monto Dolar"
+      ],
+      "aggregation": "by_partida",
       "metric": {
         "key": "presupuesto_ley",
         "name": "Presupuesto de Ley",

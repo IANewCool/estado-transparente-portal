@@ -590,6 +590,307 @@ fn is_excel_file(mime_type: &str, storage_path: &str) -> bool {
         || storage_path.ends_with(".xlsx")
 }
 
+// =============================================================================
+// DIPRES LEY CSV PARSER - Ley de Presupuestos format (semicolon delimiter)
+// =============================================================================
+// Source: https://www.dipres.gob.cl/597/articles-397499_doc_csv.csv
+// Documentation: docs/SOURCES.md
+//
+// Expected columns (exact, in order):
+//   Partida;Capitulo;Programa;Subtitulo;Ítem;Asignacion;Denominacion;Monto Pesos;Monto Dolar
+//
+// This parser:
+// - Uses semicolon delimiter
+// - Validates exact column structure
+// - Aggregates by Partida (ministerio/servicio)
+// - Fails explicitly on ambiguity (PRINCIPLES.md #3)
+// =============================================================================
+
+/// Expected header for DIPRES Ley CSV (exact match required)
+const DIPRES_LEY_EXPECTED_HEADERS: &[&str] = &[
+    "Partida",
+    "Capitulo",
+    "Programa",
+    "Subtitulo",
+    "Ítem",
+    "Asignacion",
+    "Denominacion",
+    "Monto Pesos",
+    "Monto Dolar",
+];
+
+/// Row from DIPRES Ley CSV
+#[derive(Debug)]
+struct DipresLeyRow {
+    partida: String,
+    capitulo: String,
+    programa: String,
+    subtitulo: String,
+    item: String,
+    asignacion: String,
+    denominacion: String,
+    monto_pesos: i64,
+    monto_dolar: i64,
+    line_num: usize,
+}
+
+/// Aggregated fact by Partida
+#[derive(Debug)]
+struct PartidaAggregate {
+    partida_code: String,
+    partida_name: String,
+    total_monto: i64,
+    row_count: usize,
+    first_line: usize,
+    last_line: usize,
+}
+
+/// Parse DIPRES Ley de Presupuestos CSV
+/// This function is DETERMINISTIC: same CSV = same output
+///
+/// Follows PRINCIPLES.md:
+/// - #1 Determinism: Same input = same output
+/// - #2 Evidence: Full provenance tracking
+/// - #3 Halt on ambiguity: Fails on unexpected structure
+/// - #4 Domain separation: Only parses Ley de Presupuestos format
+fn parse_dipres_ley_csv(content: &str, source_id: &str) -> Result<Vec<ParsedFact>> {
+    println!("=== DIPRES Ley CSV Parser ===");
+    println!("Source ID: {}", source_id);
+
+    // Extract year from source_id (e.g., "dipres-ley-presupuestos-2026")
+    let year: i32 = source_id
+        .split('-')
+        .filter_map(|s| s.parse::<i32>().ok())
+        .find(|&y| y >= 2000 && y <= 2100)
+        .context("AMBIGUITY: Cannot extract year from source_id. Expected format: dipres-ley-presupuestos-YYYY")?;
+
+    println!("Fiscal year: {}", year);
+
+    // Remove UTF-8 BOM if present
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+
+    // Create CSV reader with semicolon delimiter
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(b';')
+        .flexible(false)  // Strict: all rows must have same number of fields
+        .trim(csv::Trim::All)
+        .from_reader(content.as_bytes());
+
+    // Validate headers exactly match expected
+    let headers: Vec<String> = reader
+        .headers()
+        .context("Failed to read CSV headers")?
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+
+    println!("Found {} columns", headers.len());
+
+    if headers.len() != DIPRES_LEY_EXPECTED_HEADERS.len() {
+        anyhow::bail!(
+            "AMBIGUITY: Expected {} columns, found {}. Headers: {:?}",
+            DIPRES_LEY_EXPECTED_HEADERS.len(),
+            headers.len(),
+            headers
+        );
+    }
+
+    // Validate each header matches exactly
+    for (i, (found, expected)) in headers.iter().zip(DIPRES_LEY_EXPECTED_HEADERS.iter()).enumerate() {
+        if found != *expected {
+            anyhow::bail!(
+                "AMBIGUITY: Column {} mismatch. Expected '{}', found '{}'",
+                i,
+                expected,
+                found
+            );
+        }
+    }
+
+    println!("Headers validated: {:?}", headers);
+
+    // Parse all rows
+    let mut rows: Vec<DipresLeyRow> = Vec::new();
+    let mut parse_errors: Vec<String> = Vec::new();
+
+    for (line_idx, result) in reader.records().enumerate() {
+        let line_num = line_idx + 2; // +1 for 0-index, +1 for header
+
+        let record = match result {
+            Ok(r) => r,
+            Err(e) => {
+                parse_errors.push(format!("Line {}: CSV parse error: {}", line_num, e));
+                continue;
+            }
+        };
+
+        // Validate field count
+        if record.len() != 9 {
+            parse_errors.push(format!(
+                "Line {}: Expected 9 fields, found {}",
+                line_num,
+                record.len()
+            ));
+            continue;
+        }
+
+        // Parse monto_pesos (required, must be valid integer)
+        let monto_pesos: i64 = match record.get(7) {
+            Some(s) => {
+                let cleaned = s.trim();
+                if cleaned.is_empty() {
+                    0
+                } else {
+                    cleaned.parse().map_err(|e| {
+                        parse_errors.push(format!(
+                            "Line {}: Invalid 'Monto Pesos' value '{}': {}",
+                            line_num, cleaned, e
+                        ));
+                    }).unwrap_or(0)
+                }
+            }
+            None => {
+                parse_errors.push(format!("Line {}: Missing 'Monto Pesos' field", line_num));
+                continue;
+            }
+        };
+
+        // Parse monto_dolar (optional, default 0)
+        let monto_dolar: i64 = record
+            .get(8)
+            .and_then(|s| {
+                let cleaned = s.trim();
+                if cleaned.is_empty() { Some(0) } else { cleaned.parse().ok() }
+            })
+            .unwrap_or(0);
+
+        rows.push(DipresLeyRow {
+            partida: record.get(0).unwrap_or("").trim().to_string(),
+            capitulo: record.get(1).unwrap_or("").trim().to_string(),
+            programa: record.get(2).unwrap_or("").trim().to_string(),
+            subtitulo: record.get(3).unwrap_or("").trim().to_string(),
+            item: record.get(4).unwrap_or("").trim().to_string(),
+            asignacion: record.get(5).unwrap_or("").trim().to_string(),
+            denominacion: record.get(6).unwrap_or("").trim().to_string(),
+            monto_pesos,
+            monto_dolar,
+            line_num,
+        });
+    }
+
+    println!("Parsed {} rows", rows.len());
+
+    // Report parse errors (but continue if we have valid rows)
+    if !parse_errors.is_empty() {
+        println!("Parse warnings ({}):", parse_errors.len());
+        for (i, err) in parse_errors.iter().take(5).enumerate() {
+            println!("  [{}] {}", i + 1, err);
+        }
+        if parse_errors.len() > 5 {
+            println!("  ... and {} more", parse_errors.len() - 5);
+        }
+    }
+
+    if rows.is_empty() {
+        anyhow::bail!("AMBIGUITY: No valid rows parsed from CSV");
+    }
+
+    // Aggregate by Partida
+    // Using BTreeMap for deterministic ordering
+    let mut aggregates: std::collections::BTreeMap<String, PartidaAggregate> = std::collections::BTreeMap::new();
+
+    for row in &rows {
+        // Skip rows with empty partida
+        if row.partida.is_empty() {
+            continue;
+        }
+
+        let entry = aggregates.entry(row.partida.clone()).or_insert_with(|| {
+            // Use first denominacion as the name for this partida
+            PartidaAggregate {
+                partida_code: row.partida.clone(),
+                partida_name: row.denominacion.clone(),
+                total_monto: 0,
+                row_count: 0,
+                first_line: row.line_num,
+                last_line: row.line_num,
+            }
+        });
+
+        entry.total_monto += row.monto_pesos;
+        entry.row_count += 1;
+        entry.last_line = row.line_num;
+    }
+
+    println!("Aggregated into {} partidas", aggregates.len());
+
+    if aggregates.is_empty() {
+        anyhow::bail!("AMBIGUITY: No partidas found after aggregation");
+    }
+
+    // Create period dates
+    let period_start = NaiveDate::from_ymd_opt(year, 1, 1)
+        .context("Invalid year for period_start")?;
+    let period_end = NaiveDate::from_ymd_opt(year, 12, 31)
+        .context("Invalid year for period_end")?;
+
+    // Convert aggregates to facts
+    let mut facts: Vec<ParsedFact> = Vec::new();
+
+    for (partida_code, agg) in &aggregates {
+        // Normalize entity key: partida code padded to 2 digits
+        let entity_key = format!("partida_{:0>2}", partida_code);
+
+        // Entity name: use the first denominacion, or construct from code
+        let entity_name = if agg.partida_name.is_empty() {
+            format!("Partida {}", partida_code)
+        } else {
+            agg.partida_name.clone()
+        };
+
+        facts.push(ParsedFact {
+            entity_key,
+            entity_name,
+            entity_type: "partida".to_string(),
+            metric_key: "presupuesto_ley".to_string(),
+            metric_name: "Presupuesto de Ley".to_string(),
+            metric_unit: "CLP".to_string(),
+            period_start,
+            period_end,
+            value_num: agg.total_monto as f64 * 1000.0, // CSV is in thousands of pesos
+            location: format!(
+                "dipres_ley_csv:partida={}:lines={}-{}:rows={}",
+                partida_code, agg.first_line, agg.last_line, agg.row_count
+            ),
+            dims: serde_json::json!({
+                "partida_code": partida_code,
+                "aggregated_rows": agg.row_count,
+                "source_file": "articles-397499_doc_csv.csv"
+            }),
+        });
+    }
+
+    // Sort by entity_key for deterministic output
+    facts.sort_by(|a, b| a.entity_key.cmp(&b.entity_key));
+
+    println!("Created {} facts", facts.len());
+
+    // Print summary
+    let total_presupuesto: f64 = facts.iter().map(|f| f.value_num).sum();
+    println!(
+        "Total presupuesto: {} CLP ({:.2} billones)",
+        total_presupuesto,
+        total_presupuesto / 1_000_000_000_000.0
+    );
+
+    Ok(facts)
+}
+
+/// Detect if source is DIPRES Ley CSV format
+fn is_dipres_ley_csv(source_id: &str) -> bool {
+    source_id.starts_with("dipres-ley-presupuestos")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -644,13 +945,21 @@ async fn main() -> Result<()> {
             // Parse as Excel (XLS/XLSX)
             println!("\nDetected Excel format - using DIPRES XLS parser");
             parse_dipres_xls(Path::new(&artifact.storage_path), &artifact.source_id)?
-        } else {
-            // Parse as CSV (default)
+        } else if is_dipres_ley_csv(&artifact.source_id) {
+            // Parse as DIPRES Ley CSV (semicolon delimiter)
             let content = fs::read_to_string(&artifact.storage_path)
                 .await
                 .context("Failed to read artifact file")?;
             println!("Content size: {} bytes", content.len());
-            println!("Parsing CSV...");
+            println!("\nDetected DIPRES Ley CSV format - using specialized parser");
+            parse_dipres_ley_csv(&content, &artifact.source_id)?
+        } else {
+            // Parse as generic CSV (comma delimiter)
+            let content = fs::read_to_string(&artifact.storage_path)
+                .await
+                .context("Failed to read artifact file")?;
+            println!("Content size: {} bytes", content.len());
+            println!("Parsing generic CSV...");
             parse_csv(&content, &artifact.source_id)?
         };
 
@@ -1052,5 +1361,120 @@ Ministerio de Salud,Personal,2024,980000000000
         assert_eq!(facts[0].entity_key, "ministerio_de_educación");
         assert_eq!(facts[0].value_num, 1250000000000.0);
         assert_eq!(facts[0].dims["category"], "Personal");
+    }
+
+    // -------------------------------------------------------------------------
+    // DIPRES LEY CSV PARSER TESTS
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_dipres_ley_csv_basic() {
+        let csv = "Partida;Capitulo;Programa;Subtitulo;Ítem;Asignacion;Denominacion;Monto Pesos;Monto Dolar\n\
+                   01;01;01;21;00;000;PRESIDENCIA DE LA REPÚBLICA;100000;0\n\
+                   01;01;01;22;00;000;BIENES Y SERVICIOS;50000;0\n";
+
+        let facts = parse_dipres_ley_csv(csv, "dipres-ley-presupuestos-2026").unwrap();
+
+        assert_eq!(facts.len(), 1); // Aggregated by partida
+        assert_eq!(facts[0].entity_key, "partida_01");
+        assert_eq!(facts[0].metric_key, "presupuesto_ley");
+        assert_eq!(facts[0].value_num, 150000.0 * 1000.0); // CSV is in thousands
+        assert_eq!(facts[0].period_start.year(), 2026);
+    }
+
+    #[test]
+    fn test_dipres_ley_csv_multiple_partidas() {
+        let csv = "Partida;Capitulo;Programa;Subtitulo;Ítem;Asignacion;Denominacion;Monto Pesos;Monto Dolar\n\
+                   01;01;01;21;00;000;PRESIDENCIA;100000;0\n\
+                   02;01;01;21;00;000;CONGRESO NACIONAL;200000;0\n\
+                   03;01;01;21;00;000;PODER JUDICIAL;300000;0\n";
+
+        let facts = parse_dipres_ley_csv(csv, "dipres-ley-presupuestos-2026").unwrap();
+
+        assert_eq!(facts.len(), 3);
+        // Sorted by entity_key
+        assert_eq!(facts[0].entity_key, "partida_01");
+        assert_eq!(facts[1].entity_key, "partida_02");
+        assert_eq!(facts[2].entity_key, "partida_03");
+    }
+
+    #[test]
+    fn test_dipres_ley_csv_aggregation() {
+        let csv = "Partida;Capitulo;Programa;Subtitulo;Ítem;Asignacion;Denominacion;Monto Pesos;Monto Dolar\n\
+                   01;01;01;21;00;000;ITEM A;100000;0\n\
+                   01;01;02;22;00;000;ITEM B;200000;0\n\
+                   01;02;01;21;00;000;ITEM C;300000;0\n";
+
+        let facts = parse_dipres_ley_csv(csv, "dipres-ley-presupuestos-2026").unwrap();
+
+        assert_eq!(facts.len(), 1); // All same partida
+        assert_eq!(facts[0].value_num, 600000.0 * 1000.0); // Sum of all
+        assert_eq!(facts[0].dims["aggregated_rows"], 3);
+    }
+
+    #[test]
+    fn test_dipres_ley_csv_determinism() {
+        let csv = "Partida;Capitulo;Programa;Subtitulo;Ítem;Asignacion;Denominacion;Monto Pesos;Monto Dolar\n\
+                   01;01;01;21;00;000;ITEM A;100000;0\n\
+                   02;01;01;21;00;000;ITEM B;200000;0\n";
+
+        let result1 = parse_dipres_ley_csv(csv, "dipres-ley-presupuestos-2026").unwrap();
+        let result2 = parse_dipres_ley_csv(csv, "dipres-ley-presupuestos-2026").unwrap();
+
+        // Must be identical
+        assert_eq!(result1.len(), result2.len());
+        for (a, b) in result1.iter().zip(result2.iter()) {
+            assert_eq!(a.entity_key, b.entity_key);
+            assert_eq!(a.value_num, b.value_num);
+            assert_eq!(a.location, b.location);
+        }
+    }
+
+    #[test]
+    fn test_dipres_ley_csv_wrong_headers_fails() {
+        let csv = "Wrong;Headers;Here;For;Testing;Invalid;Format;Columns;Data\n\
+                   01;01;01;21;00;000;ITEM;100000;0\n";
+
+        let result = parse_dipres_ley_csv(csv, "dipres-ley-presupuestos-2026");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("AMBIGUITY"));
+    }
+
+    #[test]
+    fn test_dipres_ley_csv_wrong_column_count_fails() {
+        let csv = "Partida;Capitulo;Programa;Subtitulo;Ítem;Asignacion;Denominacion;Monto Pesos\n\
+                   01;01;01;21;00;000;ITEM;100000\n"; // Missing Monto Dolar column
+
+        let result = parse_dipres_ley_csv(csv, "dipres-ley-presupuestos-2026");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("AMBIGUITY"));
+    }
+
+    #[test]
+    fn test_dipres_ley_csv_no_year_in_source_id_fails() {
+        let csv = "Partida;Capitulo;Programa;Subtitulo;Ítem;Asignacion;Denominacion;Monto Pesos;Monto Dolar\n\
+                   01;01;01;21;00;000;ITEM;100000;0\n";
+
+        let result = parse_dipres_ley_csv(csv, "dipres-ley-presupuestos");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("AMBIGUITY"));
+    }
+
+    #[test]
+    fn test_dipres_ley_csv_with_bom() {
+        // UTF-8 BOM + valid CSV
+        let csv = "\u{feff}Partida;Capitulo;Programa;Subtitulo;Ítem;Asignacion;Denominacion;Monto Pesos;Monto Dolar\n\
+                   01;01;01;21;00;000;TEST;100000;0\n";
+
+        let facts = parse_dipres_ley_csv(csv, "dipres-ley-presupuestos-2026").unwrap();
+        assert_eq!(facts.len(), 1);
+    }
+
+    #[test]
+    fn test_is_dipres_ley_csv() {
+        assert!(is_dipres_ley_csv("dipres-ley-presupuestos-2026"));
+        assert!(is_dipres_ley_csv("dipres-ley-presupuestos-2025"));
+        assert!(!is_dipres_ley_csv("dipres-presupuesto-2026"));
+        assert!(!is_dipres_ley_csv("demo-presupuesto"));
     }
 }
