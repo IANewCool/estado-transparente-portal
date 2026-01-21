@@ -14,10 +14,11 @@ use anyhow::{Context, Result};
 use calamine::{open_workbook_auto, Data, Reader};
 use chrono::NaiveDate;
 use clap::Parser;
+use encoding_rs::WINDOWS_1252;
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use tokio::fs;
 use uuid::Uuid;
@@ -596,28 +597,70 @@ fn is_excel_file(mime_type: &str, storage_path: &str) -> bool {
 // Source: https://www.dipres.gob.cl/597/articles-397499_doc_csv.csv
 // Documentation: docs/SOURCES.md
 //
-// Expected columns (exact, in order):
-//   Partida;Capitulo;Programa;Subtitulo;Ítem;Asignacion;Denominacion;Monto Pesos;Monto Dolar
+// Expected columns (normalized, in order):
+//   Partida;Capitulo;Programa;Subtitulo;Item;Asignacion;Denominacion;Monto Pesos;Monto Dolar
 //
 // This parser:
 // - Uses semicolon delimiter
-// - Validates exact column structure
+// - Handles multiple encodings (UTF-8, UTF-8 BOM, Latin-1/Windows-1252)
+// - Normalizes header names (removes accents for consistent matching)
+// - Validates column structure
 // - Aggregates by Partida (ministerio/servicio)
 // - Fails explicitly on ambiguity (PRINCIPLES.md #3)
 // =============================================================================
 
-/// Expected header for DIPRES Ley CSV (exact match required)
+/// Expected headers for DIPRES Ley CSV (normalized without accents)
 const DIPRES_LEY_EXPECTED_HEADERS: &[&str] = &[
     "Partida",
     "Capitulo",
     "Programa",
     "Subtitulo",
-    "Ítem",
+    "Item",
     "Asignacion",
     "Denominacion",
     "Monto Pesos",
     "Monto Dolar",
 ];
+
+/// Official DIPRES Partida names
+/// Source: https://www.dipres.gob.cl/598/w3-propertyvalue-15954.html
+fn get_partida_name(code: &str) -> String {
+    match code {
+        "01" => "Presidencia de la República".to_string(),
+        "02" => "Congreso Nacional".to_string(),
+        "03" => "Poder Judicial".to_string(),
+        "04" => "Contraloría General de la República".to_string(),
+        "05" => "Ministerio del Interior y Seguridad Pública".to_string(),
+        "06" => "Ministerio de Relaciones Exteriores".to_string(),
+        "07" => "Ministerio de Economía, Fomento y Turismo".to_string(),
+        "08" => "Ministerio de Hacienda".to_string(),
+        "09" => "Ministerio de Educación".to_string(),
+        "10" => "Ministerio de Justicia y Derechos Humanos".to_string(),
+        "11" => "Ministerio de Defensa Nacional".to_string(),
+        "12" => "Ministerio de Obras Públicas".to_string(),
+        "13" => "Ministerio de Agricultura".to_string(),
+        "14" => "Ministerio de Bienes Nacionales".to_string(),
+        "15" => "Ministerio del Trabajo y Previsión Social".to_string(),
+        "16" => "Ministerio de Salud".to_string(),
+        "17" => "Ministerio de Minería".to_string(),
+        "18" => "Ministerio de Vivienda y Urbanismo".to_string(),
+        "19" => "Ministerio de Transportes y Telecomunicaciones".to_string(),
+        "20" => "Ministerio Secretaría General de Gobierno".to_string(),
+        "21" => "Ministerio de Desarrollo Social y Familia".to_string(),
+        "22" => "Ministerio Secretaría General de la Presidencia".to_string(),
+        "23" => "Ministerio de Energía".to_string(),
+        "24" => "Ministerio del Medio Ambiente".to_string(),
+        "25" => "Ministerio del Deporte".to_string(),
+        "26" => "Ministerio de la Mujer y la Equidad de Género".to_string(),
+        "27" => "Ministerio de Ciencia, Tecnología, Conocimiento e Innovación".to_string(),
+        "28" => "Ministerio de las Culturas, las Artes y el Patrimonio".to_string(),
+        "29" => "Servicio Electoral".to_string(),
+        "30" => "Ministerio Público".to_string(),
+        "31" => "Ministerio de Seguridad Pública".to_string(),
+        "50" => "Tesoro Público".to_string(),
+        _ => format!("Partida {}", code),
+    }
+}
 
 /// Row from DIPRES Ley CSV
 #[derive(Debug)]
@@ -643,6 +686,67 @@ struct PartidaAggregate {
     row_count: usize,
     first_line: usize,
     last_line: usize,
+}
+
+/// Detect and convert encoding from raw bytes to UTF-8 string
+/// Handles: UTF-8 BOM, UTF-8, and Latin-1/Windows-1252 (common for older DIPRES files)
+fn decode_to_utf8(raw_bytes: &[u8]) -> String {
+    // Check for UTF-8 BOM
+    let bytes = if raw_bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        println!("Detected: UTF-8 with BOM");
+        &raw_bytes[3..]
+    } else {
+        raw_bytes
+    };
+
+    // Try UTF-8 first
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        println!("Encoding: UTF-8");
+        return s.to_string();
+    }
+
+    // Fall back to Windows-1252 (Latin-1 superset, common in Chilean gov files)
+    println!("Encoding: Windows-1252 (Latin-1)");
+    let (decoded, _, had_errors) = WINDOWS_1252.decode(bytes);
+    if had_errors {
+        println!("Warning: Some characters could not be decoded");
+    }
+    decoded.into_owned()
+}
+
+/// Normalize header name by removing accents and standardizing case
+/// This allows matching across different file encodings (UTF-8 vs Latin-1)
+fn normalize_header(header: &str) -> String {
+    header
+        .replace("Capítulo", "Capitulo")
+        .replace("Subtítulo", "Subtitulo")
+        .replace("Ítem", "Item")
+        .replace("Asignación", "Asignacion")
+        .replace("Denominación", "Denominacion")
+        .replace("Dólar", "Dolar")
+        // Handle Windows-1252 encoded accents that got decoded
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+        .replace("á", "a")
+        .replace("é", "e")
+        .replace("ñ", "n") // Keep ñ? Actually, normalize it too for consistency
+        .trim()
+        .to_string()
+}
+
+/// Parse DIPRES Ley de Presupuestos CSV from raw bytes
+/// This function is DETERMINISTIC: same bytes = same output
+///
+/// Follows PRINCIPLES.md:
+/// - #1 Determinism: Same input = same output
+/// - #2 Evidence: Full provenance tracking
+/// - #3 Halt on ambiguity: Fails on unexpected structure
+/// - #4 Domain separation: Only parses Ley de Presupuestos format
+fn parse_dipres_ley_csv_bytes(raw_bytes: &[u8], source_id: &str) -> Result<Vec<ParsedFact>> {
+    // Decode bytes to UTF-8 string, handling different encodings
+    let content = decode_to_utf8(raw_bytes);
+    parse_dipres_ley_csv(&content, source_id)
 }
 
 /// Parse DIPRES Ley de Presupuestos CSV
@@ -676,33 +780,39 @@ fn parse_dipres_ley_csv(content: &str, source_id: &str) -> Result<Vec<ParsedFact
         .trim(csv::Trim::All)
         .from_reader(content.as_bytes());
 
-    // Validate headers exactly match expected
-    let headers: Vec<String> = reader
+    // Validate headers match expected (with normalization for accents/encoding differences)
+    let raw_headers: Vec<String> = reader
         .headers()
         .context("Failed to read CSV headers")?
         .iter()
         .map(|h| h.to_string())
         .collect();
 
+    // Normalize headers for comparison (handle accented vs non-accented)
+    let headers: Vec<String> = raw_headers.iter().map(|h| normalize_header(h)).collect();
+
     println!("Found {} columns", headers.len());
+    println!("Raw headers: {:?}", raw_headers);
+    println!("Normalized headers: {:?}", headers);
 
     if headers.len() != DIPRES_LEY_EXPECTED_HEADERS.len() {
         anyhow::bail!(
             "AMBIGUITY: Expected {} columns, found {}. Headers: {:?}",
             DIPRES_LEY_EXPECTED_HEADERS.len(),
             headers.len(),
-            headers
+            raw_headers
         );
     }
 
-    // Validate each header matches exactly
+    // Validate each normalized header matches expected
     for (i, (found, expected)) in headers.iter().zip(DIPRES_LEY_EXPECTED_HEADERS.iter()).enumerate() {
         if found != *expected {
             anyhow::bail!(
-                "AMBIGUITY: Column {} mismatch. Expected '{}', found '{}'",
+                "AMBIGUITY: Column {} mismatch. Expected '{}', found '{}' (raw: '{}')",
                 i,
                 expected,
-                found
+                found,
+                raw_headers[i]
             );
         }
     }
@@ -806,10 +916,10 @@ fn parse_dipres_ley_csv(content: &str, source_id: &str) -> Result<Vec<ParsedFact
         }
 
         let entry = aggregates.entry(row.partida.clone()).or_insert_with(|| {
-            // Use first denominacion as the name for this partida
+            // Use official partida name from lookup table
             PartidaAggregate {
                 partida_code: row.partida.clone(),
-                partida_name: row.denominacion.clone(),
+                partida_name: get_partida_name(&row.partida),
                 total_monto: 0,
                 row_count: 0,
                 first_line: row.line_num,
@@ -947,12 +1057,13 @@ async fn main() -> Result<()> {
             parse_dipres_xls(Path::new(&artifact.storage_path), &artifact.source_id)?
         } else if is_dipres_ley_csv(&artifact.source_id) {
             // Parse as DIPRES Ley CSV (semicolon delimiter)
-            let content = fs::read_to_string(&artifact.storage_path)
+            // Read as raw bytes to handle different encodings (UTF-8, Latin-1)
+            let raw_bytes = fs::read(&artifact.storage_path)
                 .await
                 .context("Failed to read artifact file")?;
-            println!("Content size: {} bytes", content.len());
+            println!("Content size: {} bytes", raw_bytes.len());
             println!("\nDetected DIPRES Ley CSV format - using specialized parser");
-            parse_dipres_ley_csv(&content, &artifact.source_id)?
+            parse_dipres_ley_csv_bytes(&raw_bytes, &artifact.source_id)?
         } else {
             // Parse as generic CSV (comma delimiter)
             let content = fs::read_to_string(&artifact.storage_path)
@@ -1476,5 +1587,74 @@ Ministerio de Salud,Personal,2024,980000000000
         assert!(is_dipres_ley_csv("dipres-ley-presupuestos-2025"));
         assert!(!is_dipres_ley_csv("dipres-presupuesto-2026"));
         assert!(!is_dipres_ley_csv("demo-presupuesto"));
+    }
+
+    // ==========================================================================
+    // Encoding and Header Normalization Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_normalize_header_no_accents() {
+        assert_eq!(normalize_header("Partida"), "Partida");
+        assert_eq!(normalize_header("Monto Pesos"), "Monto Pesos");
+    }
+
+    #[test]
+    fn test_normalize_header_with_accents() {
+        assert_eq!(normalize_header("Capítulo"), "Capitulo");
+        assert_eq!(normalize_header("Subtítulo"), "Subtitulo");
+        assert_eq!(normalize_header("Ítem"), "Item");
+        assert_eq!(normalize_header("Asignación"), "Asignacion");
+        assert_eq!(normalize_header("Denominación"), "Denominacion");
+        assert_eq!(normalize_header("Monto Dólar"), "Monto Dolar");
+    }
+
+    #[test]
+    fn test_normalize_header_trims_whitespace() {
+        assert_eq!(normalize_header("  Partida  "), "Partida");
+        assert_eq!(normalize_header("\tCapítulo\t"), "Capitulo");
+    }
+
+    #[test]
+    fn test_decode_to_utf8_with_bom() {
+        // UTF-8 BOM + "Partida"
+        let bytes = [0xEF, 0xBB, 0xBF, b'P', b'a', b'r', b't', b'i', b'd', b'a'];
+        let result = decode_to_utf8(&bytes);
+        assert_eq!(result, "Partida");
+    }
+
+    #[test]
+    fn test_decode_to_utf8_plain_utf8() {
+        let bytes = "Partida;Capítulo".as_bytes();
+        let result = decode_to_utf8(bytes);
+        assert_eq!(result, "Partida;Capítulo");
+    }
+
+    #[test]
+    fn test_decode_to_utf8_latin1() {
+        // "Capítulo" in Windows-1252/Latin-1: "Cap" + 0xED (í) + "tulo"
+        let bytes = [b'C', b'a', b'p', 0xED, b't', b'u', b'l', b'o'];
+        let result = decode_to_utf8(&bytes);
+        assert_eq!(result, "Capítulo");
+    }
+
+    #[test]
+    fn test_dipres_ley_csv_with_accented_headers() {
+        // Test that accented headers work (like 2021 file format)
+        let csv = "\u{feff}Partida;Capítulo;Programa;Subtítulo;Ítem;Asignación;Denominación;Monto Pesos;Monto Dólar\n\
+                   01;01;01;21;01;001;GASTOS EN PERSONAL;1000000;100\n";
+
+        let facts = parse_dipres_ley_csv(csv, "dipres-ley-presupuestos-2021").unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].period_start.year(), 2021);
+    }
+
+    #[test]
+    fn test_dipres_ley_csv_bytes_utf8() {
+        let csv = "\u{feff}Partida;Capitulo;Programa;Subtitulo;Item;Asignacion;Denominacion;Monto Pesos;Monto Dolar\n\
+                   01;01;01;21;01;001;GASTOS EN PERSONAL;1000000;100\n";
+
+        let facts = parse_dipres_ley_csv_bytes(csv.as_bytes(), "dipres-ley-presupuestos-2026").unwrap();
+        assert_eq!(facts.len(), 1);
     }
 }
