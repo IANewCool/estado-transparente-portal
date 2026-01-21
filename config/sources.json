@@ -1,0 +1,239 @@
+{
+  "version": "1.0",
+  "description": "Fuentes oficiales de datos fiscales chilenos",
+  "sources": [
+    {
+      "id": "dipres-presupuesto-ley",
+      "name": "Ley de Presupuestos - DIPRES",
+      "description": "Presupuesto aprobado por ley para cada año fiscal",
+      "provider": "Dirección de Presupuestos (DIPRES)",
+      "provider_url": "https://www.dipres.gob.cl",
+      "category": "presupuesto",
+      "format": "csv",
+      "frequency": "annual",
+      "urls": [
+        {
+          "year": 2024,
+          "url": "https://www.dipres.gob.cl/597/articles-315478_doc_xls.xls",
+          "description": "Ley de Presupuestos 2024"
+        },
+        {
+          "year": 2025,
+          "url": "https://www.dipres.gob.cl/597/articles-330000_doc_xls.xls",
+          "description": "Ley de Presupuestos 2025"
+        }
+      ],
+      "parser": "dipres_presupuesto",
+      "enabled": true
+    },
+    {
+      "id": "dipres-ejecucion-presupuestaria",
+      "name": "Ejecución Presupuestaria Mensual - DIPRES",
+      "description": "Informe mensual de ejecución del presupuesto",
+      "provider": "Dirección de Presupuestos (DIPRES)",
+      "provider_url": "https://www.dipres.gob.cl",
+      "category": "gasto",
+      "format": "csv",
+      "frequency": "monthly",
+      "urls": [
+        {
+          "year": 2024,
+          "month": 12,
+          "url": "https://www.dipres.gob.cl/597/articles-325000_ejecucion_diciembre_2024.csv",
+          "description": "Ejecución Diciembre 2024"
+        }
+      ],
+      "parser": "dipres_ejecucion",
+      "enabled": true
+    },
+    {
+      "id": "dipres-dotacion",
+      "name": "Dotación de Personal del Sector Público",
+      "description": "Cantidad de funcionarios por servicio público",
+      "provider": "Dirección de Presupuestos (DIPRES)",
+      "provider_url": "https://www.dipres.gob.cl",
+      "category": "dotacion",
+      "format": "csv",
+      "frequency": "quarterly",
+      "urls": [
+        {
+          "year": 2024,
+          "quarter": 4,
+          "url": "https://www.dipres.gob.cl/597/articles-320000_dotacion_q4_2024.csv",
+          "description": "Dotación Q4 2024"
+        }
+      ],
+      "parser": "dipres_dotacion",
+      "enabled": true
+    },
+    {
+      "id": "chilecompra-licitaciones",
+      "name": "Licitaciones Públicas - ChileCompra",
+      "description": "Procesos de compra y contratación pública",
+      "provider": "ChileCompra",
+      "provider_url": "https://www.mercadopublico.cl",
+      "api_url": "https://api.mercadopublico.cl/servicios/v1/publico/licitaciones.json",
+      "category": "compras",
+      "format": "json",
+      "frequency": "daily",
+      "requires_api_key": true,
+      "parser": "chilecompra_licitaciones",
+      "enabled": true
+    },
+    {
+      "id": "chilecompra-ordenes",
+      "name": "Órdenes de Compra - ChileCompra",
+      "description": "Órdenes de compra emitidas por organismos públicos",
+      "provider": "ChileCompra",
+      "provider_url": "https://www.mercadopublico.cl",
+      "api_url": "https://api.mercadopublico.cl/servicios/v1/publico/ordenesdecompra.json",
+      "category": "compras",
+      "format": "json",
+      "frequency": "daily",
+      "requires_api_key": true,
+      "parser": "chilecompra_ordenes",
+      "enabled": true
+    },
+    {
+      "id": "contraloria-personal",
+      "name": "Remuneraciones Sector Público - Contraloría",
+      "description": "Información de remuneraciones de funcionarios públicos",
+      "provider": "Contraloría General de la República",
+      "provider_url": "https://www.contraloria.cl",
+      "category": "remuneraciones",
+      "format": "csv",
+      "frequency": "annual",
+      "urls": [
+        {
+          "year": 2024,
+          "url": "https://www.contraloria.cl/documents/personal_2024.csv",
+          "description": "Remuneraciones 2024"
+        }
+      ],
+      "parser": "contraloria_personal",
+      "enabled": false,
+      "notes": "Requiere scraping, no hay API pública"
+    },
+    {
+      "id": "datos-gob-presupuesto",
+      "name": "Presupuesto - Datos.gob.cl",
+      "description": "Datos abiertos de presupuesto del portal oficial",
+      "provider": "Datos.gob.cl",
+      "provider_url": "https://datos.gob.cl",
+      "category": "presupuesto",
+      "format": "csv",
+      "frequency": "annual",
+      "urls": [
+        {
+          "year": 2024,
+          "url": "https://datos.gob.cl/dataset/presupuesto-sector-publico/resource/presupuesto_2024.csv",
+          "description": "Presupuesto 2024"
+        }
+      ],
+      "parser": "datos_gob_presupuesto",
+      "enabled": true
+    },
+    {
+      "id": "transparencia-activa",
+      "name": "Transparencia Activa - CPLT",
+      "description": "Información de transparencia activa de organismos públicos",
+      "provider": "Consejo para la Transparencia (CPLT)",
+      "provider_url": "https://www.consejotransparencia.cl",
+      "category": "transparencia",
+      "format": "json",
+      "frequency": "monthly",
+      "api_url": "https://www.portaltransparencia.cl/api/v1/",
+      "parser": "transparencia_activa",
+      "enabled": false,
+      "notes": "API en desarrollo"
+    }
+  ],
+  "parsers": {
+    "dipres_presupuesto": {
+      "type": "csv",
+      "columns": {
+        "entity": ["partida", "capitulo", "programa"],
+        "year": ["anio", "año"],
+        "amount": ["monto_ley", "presupuesto_inicial", "ppto_inicial"],
+        "category": ["subtitulo", "item", "asignacion"]
+      },
+      "metric": {
+        "key": "presupuesto_ley",
+        "name": "Presupuesto de Ley",
+        "unit": "CLP"
+      }
+    },
+    "dipres_ejecucion": {
+      "type": "csv",
+      "columns": {
+        "entity": ["partida", "capitulo", "servicio"],
+        "year": ["anio"],
+        "month": ["mes"],
+        "amount": ["ejecutado", "devengado", "gasto"],
+        "category": ["subtitulo", "item"]
+      },
+      "metric": {
+        "key": "gasto_ejecutado",
+        "name": "Gasto Ejecutado",
+        "unit": "CLP"
+      }
+    },
+    "dipres_dotacion": {
+      "type": "csv",
+      "columns": {
+        "entity": ["servicio", "organismo", "institucion"],
+        "year": ["anio"],
+        "amount": ["dotacion", "funcionarios", "planta"],
+        "category": ["tipo_contrato", "estamento"]
+      },
+      "metric": {
+        "key": "dotacion_personal",
+        "name": "Dotación de Personal",
+        "unit": "personas"
+      }
+    },
+    "chilecompra_licitaciones": {
+      "type": "json",
+      "entity_field": "Comprador.NombreOrganismo",
+      "amount_field": "MontoEstimado",
+      "date_field": "FechaCierre",
+      "metric": {
+        "key": "licitaciones_monto",
+        "name": "Monto Licitaciones",
+        "unit": "CLP"
+      }
+    },
+    "chilecompra_ordenes": {
+      "type": "json",
+      "entity_field": "Comprador.NombreOrganismo",
+      "amount_field": "Total",
+      "date_field": "Fechas.FechaEnvio",
+      "metric": {
+        "key": "ordenes_compra_monto",
+        "name": "Monto Órdenes de Compra",
+        "unit": "CLP"
+      }
+    },
+    "datos_gob_presupuesto": {
+      "type": "csv",
+      "columns": {
+        "entity": ["organismo", "servicio", "ministerio"],
+        "year": ["anio", "periodo"],
+        "amount": ["monto", "presupuesto", "valor"],
+        "category": ["categoria", "tipo", "item"]
+      },
+      "metric": {
+        "key": "presupuesto_ejecutado",
+        "name": "Presupuesto Ejecutado",
+        "unit": "CLP"
+      }
+    }
+  },
+  "api_keys": {
+    "chilecompra": {
+      "env_var": "CHILECOMPRA_API_KEY",
+      "required_for": ["chilecompra-licitaciones", "chilecompra-ordenes"],
+      "request_url": "https://desarrolladores.mercadopublico.cl/"
+    }
+  }
+}

@@ -50,7 +50,7 @@ struct Artifact {
 }
 
 /// A parsed fact ready for insertion
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 struct ParsedFact {
     entity_key: String,
     entity_name: String,
@@ -488,4 +488,301 @@ async fn main() -> Result<()> {
     println!("Ready for API queries");
 
     Ok(())
+}
+
+// =============================================================================
+// TESTS - Critical for ensuring DETERMINISM
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Datelike;
+
+    // -------------------------------------------------------------------------
+    // DETERMINISM TESTS - Same input MUST produce same output
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_csv_determinism() {
+        let csv = "entidad,categoria,anio,monto\nMinisterio de Salud,Personal,2024,1000000\n";
+
+        let result1 = parse_csv(csv, "presupuesto-test").unwrap();
+        let result2 = parse_csv(csv, "presupuesto-test").unwrap();
+
+        assert_eq!(result1.len(), result2.len());
+        assert_eq!(result1[0].entity_key, result2[0].entity_key);
+        assert_eq!(result1[0].value_num, result2[0].value_num);
+        assert_eq!(result1[0].period_start, result2[0].period_start);
+    }
+
+    #[test]
+    fn test_parse_csv_determinism_multiple_runs() {
+        let csv = r#"entidad,categoria,anio,monto
+Ministerio de Educación,Personal,2024,1250000000000
+Ministerio de Educación,Operaciones,2024,450000000000
+Ministerio de Salud,Personal,2024,980000000000
+"#;
+
+        // Run 10 times and verify identical output
+        let baseline = parse_csv(csv, "presupuesto").unwrap();
+        for _ in 0..10 {
+            let result = parse_csv(csv, "presupuesto").unwrap();
+            assert_eq!(baseline.len(), result.len());
+            for (a, b) in baseline.iter().zip(result.iter()) {
+                assert_eq!(a.entity_key, b.entity_key);
+                assert_eq!(a.metric_key, b.metric_key);
+                assert_eq!(a.value_num, b.value_num);
+                assert_eq!(a.location, b.location);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // ENTITY KEY NORMALIZATION TESTS
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_entity_key_normalization_basic() {
+        let csv = "entidad,anio,monto\nMinisterio de Salud,2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].entity_key, "ministerio_de_salud");
+    }
+
+    #[test]
+    fn test_entity_key_normalization_accents() {
+        let csv = "entidad,anio,monto\nMinisterio de Educación,2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].entity_key, "ministerio_de_educación");
+        assert_eq!(facts[0].entity_name, "Ministerio de Educación");
+    }
+
+    #[test]
+    fn test_entity_key_normalization_dots_removed() {
+        let csv = "entidad,anio,monto\nGob. Regional de Valparaíso,2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].entity_key, "gob_regional_de_valparaíso");
+    }
+
+    #[test]
+    fn test_entity_key_normalization_special_chars() {
+        let csv = "entidad,anio,monto\n\"Serv. Nacional (SERNAC)\",2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        // Only alphanumeric and underscore allowed
+        assert!(!facts[0].entity_key.contains('('));
+        assert!(!facts[0].entity_key.contains(')'));
+    }
+
+    #[test]
+    fn test_entity_key_normalization_whitespace() {
+        let csv = "entidad,anio,monto\n\"  Ministerio de Salud  \",2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].entity_key, "ministerio_de_salud");
+        assert_eq!(facts[0].entity_name, "Ministerio de Salud");
+    }
+
+    // -------------------------------------------------------------------------
+    // METRIC DETECTION TESTS
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_metric_detection_presupuesto() {
+        let csv = "entidad,anio,monto\nTest,2024,1000\n";
+        let facts = parse_csv(csv, "dipres-presupuesto-2024").unwrap();
+        assert_eq!(facts[0].metric_key, "presupuesto_ejecutado");
+        assert_eq!(facts[0].metric_name, "Presupuesto Ejecutado");
+    }
+
+    #[test]
+    fn test_metric_detection_gasto() {
+        let csv = "entidad,anio,monto\nTest,2024,1000\n";
+        let facts = parse_csv(csv, "contraloria-gasto-2024").unwrap();
+        assert_eq!(facts[0].metric_key, "gasto_total");
+        assert_eq!(facts[0].metric_name, "Gasto Total");
+    }
+
+    #[test]
+    fn test_metric_detection_dotacion() {
+        let csv = "entidad,anio,monto\nTest,2024,1000\n";
+        let facts = parse_csv(csv, "dipres-dotacion-2024").unwrap();
+        assert_eq!(facts[0].metric_key, "dotacion");
+        assert_eq!(facts[0].metric_name, "Dotación de Personal");
+    }
+
+    #[test]
+    fn test_metric_detection_unknown() {
+        let csv = "entidad,anio,monto\nTest,2024,1000\n";
+        let facts = parse_csv(csv, "unknown-source").unwrap();
+        assert_eq!(facts[0].metric_key, "monto");
+        assert_eq!(facts[0].metric_name, "Monto");
+    }
+
+    // -------------------------------------------------------------------------
+    // PERIOD DATE TESTS
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_period_dates_year_2024() {
+        let csv = "entidad,anio,monto\nTest,2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].period_start, NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+        assert_eq!(facts[0].period_end, NaiveDate::from_ymd_opt(2024, 12, 31).unwrap());
+    }
+
+    #[test]
+    fn test_period_dates_year_2025() {
+        let csv = "entidad,anio,monto\nTest,2025,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].period_start, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
+        assert_eq!(facts[0].period_end, NaiveDate::from_ymd_opt(2025, 12, 31).unwrap());
+    }
+
+    // -------------------------------------------------------------------------
+    // DIMENSIONS TESTS
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_dimensions_with_category() {
+        let csv = "entidad,categoria,anio,monto\nTest,Personal,2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].dims, serde_json::json!({"category": "Personal"}));
+    }
+
+    #[test]
+    fn test_dimensions_without_category() {
+        let csv = "entidad,anio,monto\nTest,2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].dims, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_dimensions_empty_category() {
+        let csv = "entidad,categoria,anio,monto\nTest,,2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].dims, serde_json::json!({}));
+    }
+
+    // -------------------------------------------------------------------------
+    // LINE LOCATION TESTS
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_line_location_first_row() {
+        let csv = "entidad,anio,monto\nTest,2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].location, "csv:line=2"); // Header is line 1
+    }
+
+    #[test]
+    fn test_line_location_multiple_rows() {
+        let csv = "entidad,anio,monto\nA,2024,1\nB,2024,2\nC,2024,3\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].location, "csv:line=2");
+        assert_eq!(facts[1].location, "csv:line=3");
+        assert_eq!(facts[2].location, "csv:line=4");
+    }
+
+    // -------------------------------------------------------------------------
+    // VALUE PARSING TESTS
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_value_parsing_integer() {
+        let csv = "entidad,anio,monto\nTest,2024,1000000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].value_num, 1000000.0);
+    }
+
+    #[test]
+    fn test_value_parsing_large_number() {
+        let csv = "entidad,anio,monto\nTest,2024,1250000000000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].value_num, 1250000000000.0);
+    }
+
+    #[test]
+    fn test_value_parsing_decimal() {
+        let csv = "entidad,anio,monto\nTest,2024,1234.56\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].value_num, 1234.56);
+    }
+
+    // -------------------------------------------------------------------------
+    // COLUMN ALIAS TESTS
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_column_alias_entity() {
+        let csv = "organismo,anio,monto\nTest,2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].entity_name, "Test");
+    }
+
+    #[test]
+    fn test_column_alias_year() {
+        let csv = "entidad,periodo,monto\nTest,2024,1000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].period_start.year(), 2024);
+    }
+
+    #[test]
+    fn test_column_alias_amount() {
+        let csv = "entidad,anio,valor\nTest,2024,5000\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].value_num, 5000.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // EDGE CASES
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_csv() {
+        let csv = "entidad,anio,monto\n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts.len(), 0);
+    }
+
+    #[test]
+    fn test_whitespace_trimming() {
+        let csv = "entidad,anio,monto\n  Test  ,  2024  ,  1000  \n";
+        let facts = parse_csv(csv, "test").unwrap();
+        assert_eq!(facts[0].entity_name, "Test");
+        assert_eq!(facts[0].value_num, 1000.0);
+    }
+
+    #[test]
+    fn test_multiple_entities_same_year() {
+        let csv = r#"entidad,categoria,anio,monto
+Ministerio A,Personal,2024,100
+Ministerio A,Operaciones,2024,200
+Ministerio B,Personal,2024,300
+"#;
+        let facts = parse_csv(csv, "presupuesto").unwrap();
+        assert_eq!(facts.len(), 3);
+        assert_eq!(facts[0].entity_key, "ministerio_a");
+        assert_eq!(facts[1].entity_key, "ministerio_a");
+        assert_eq!(facts[2].entity_key, "ministerio_b");
+    }
+
+    // -------------------------------------------------------------------------
+    // REAL DATA FORMAT TESTS (DIPRES format)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_dipres_budget_format() {
+        let csv = r#"entidad,categoria,anio,monto
+Ministerio de Educación,Personal,2024,1250000000000
+Ministerio de Educación,Operaciones,2024,450000000000
+Ministerio de Educación,Inversión,2024,380000000000
+Ministerio de Salud,Personal,2024,980000000000
+"#;
+        let facts = parse_csv(csv, "dipres-presupuesto-2024").unwrap();
+
+        assert_eq!(facts.len(), 4);
+        assert_eq!(facts[0].metric_key, "presupuesto_ejecutado");
+        assert_eq!(facts[0].entity_key, "ministerio_de_educación");
+        assert_eq!(facts[0].value_num, 1250000000000.0);
+        assert_eq!(facts[0].dims["category"], "Personal");
+    }
 }
