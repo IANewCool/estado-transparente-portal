@@ -1,0 +1,8 @@
+/target
+node_modules
+/apps/web/dist
+/data/raw
+*.raw
+.env
+.DS_Store
+Cargo.lock

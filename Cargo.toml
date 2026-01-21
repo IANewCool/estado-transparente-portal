@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "services/collector",
+  "services/parser",
+  "services/api"
+]
+resolver = "2"

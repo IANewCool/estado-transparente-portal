@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Artifact",
+  "type": "object",
+  "properties": {
+    "artifact_id": {
+      "type": "string"
+    },
+    "url": {
+      "type": "string"
+    },
+    "captured_at": {
+      "type": "string"
+    },
+    "content_hash": {
+      "type": "string"
+    },
+    "mime_type": {
+      "type": "string"
+    },
+    "size_bytes": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "artifact_id",
+    "url",
+    "captured_at",
+    "content_hash",
+    "mime_type",
+    "size_bytes"
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Fact",
+  "type": "object",
+  "properties": {
+    "fact_id": {
+      "type": "string"
+    },
+    "entity_id": {
+      "type": "string"
+    },
+    "metric_id": {
+      "type": "string"
+    },
+    "period_start": {
+      "type": "string"
+    },
+    "period_end": {
+      "type": "string"
+    },
+    "value_num": {
+      "type": "number"
+    },
+    "unit": {
+      "type": "string"
+    },
+    "snapshot_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "fact_id",
+    "entity_id",
+    "metric_id",
+    "period_start",
+    "period_end",
+    "value_num",
+    "unit",
+    "snapshot_id"
+  ]
+}
