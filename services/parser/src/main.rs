@@ -2,7 +2,7 @@
 //!
 //! Responsibilities:
 //! - Load artifact metadata and raw content
-//! - Parse CSV/JSON deterministically
+//! - Parse CSV/XLS deterministically
 //! - Upsert entities and metrics
 //! - Insert facts with provenance (evidence chain)
 //! - Mark artifact as parsed or failed
@@ -11,12 +11,14 @@
 //! Same artifact + same parser version = same output
 
 use anyhow::{Context, Result};
+use calamine::{open_workbook_auto, Data, Reader};
 use chrono::NaiveDate;
 use clap::Parser;
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::path::Path;
 use tokio::fs;
 use uuid::Uuid;
 
@@ -329,6 +331,265 @@ fn parse_csv(content: &str, source_id: &str) -> Result<Vec<ParsedFact>> {
     Ok(facts)
 }
 
+// =============================================================================
+// XLS PARSER - DIPRES Presupuesto Format Only
+// =============================================================================
+
+/// Known DIPRES column mappings (explicit, not inferred)
+/// These are the exact column names used in DIPRES budget files
+const DIPRES_ENTITY_COLUMNS: &[&str] = &["partida", "capitulo", "programa", "servicio", "organismo"];
+const DIPRES_YEAR_COLUMNS: &[&str] = &["año", "anio", "periodo"];
+const DIPRES_AMOUNT_COLUMNS: &[&str] = &["monto", "presupuesto", "ppto_inicial", "ley_inicial", "total"];
+const DIPRES_CATEGORY_COLUMNS: &[&str] = &["subtitulo", "item", "asignacion", "categoria"];
+
+/// Column mapping result for DIPRES XLS
+#[derive(Debug)]
+struct DipresColumnMapping {
+    entity_col: Option<usize>,
+    entity_name: String,
+    year_col: Option<usize>,
+    year_name: String,
+    amount_col: Option<usize>,
+    amount_name: String,
+    category_col: Option<usize>,
+    category_name: String,
+}
+
+/// Find column index by matching against known column names
+fn find_column(headers: &[String], candidates: &[&str]) -> Option<(usize, String)> {
+    for (idx, header) in headers.iter().enumerate() {
+        let normalized = header.trim().to_lowercase();
+        for candidate in candidates {
+            if normalized == *candidate || normalized.contains(candidate) {
+                return Some((idx, header.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// Parse DIPRES XLS file into facts
+/// This function is DETERMINISTIC: same XLS file = same output
+/// Only supports DIPRES budget format - not a general XLS parser
+fn parse_dipres_xls(file_path: &Path, source_id: &str) -> Result<Vec<ParsedFact>> {
+    println!("Opening XLS file: {}", file_path.display());
+
+    // Open workbook (calamine auto-detects format: xls, xlsx, xlsb, ods)
+    let mut workbook: calamine::Sheets<_> = open_workbook_auto(file_path)
+        .context("Failed to open XLS file")?;
+
+    // Get sheet names and use the first one
+    let sheet_names = workbook.sheet_names().to_vec();
+    if sheet_names.is_empty() {
+        anyhow::bail!("XLS file has no sheets");
+    }
+
+    let sheet_name = &sheet_names[0];
+    println!("Reading sheet: '{}' (first of {} sheets)", sheet_name, sheet_names.len());
+
+    // Get the range (all cells in the sheet)
+    let range = workbook
+        .worksheet_range(sheet_name)
+        .context("Failed to read sheet")?;
+
+    let (row_count, col_count) = range.get_size();
+    println!("Sheet size: {} rows x {} columns", row_count, col_count);
+
+    if row_count < 2 {
+        anyhow::bail!("Sheet has insufficient rows (need header + data)");
+    }
+
+    // Extract headers from first row
+    let headers: Vec<String> = range
+        .rows()
+        .next()
+        .context("No header row")?
+        .iter()
+        .map(|cell| match cell {
+            Data::String(s) => s.trim().to_string(),
+            Data::Empty => String::new(),
+            other => format!("{}", other),
+        })
+        .collect();
+
+    println!("\nDetected columns ({}):", headers.len());
+    for (i, h) in headers.iter().enumerate() {
+        if !h.is_empty() {
+            println!("  [{:2}] {}", i, h);
+        }
+    }
+
+    // Create column mapping using explicit DIPRES column names
+    let mapping = DipresColumnMapping {
+        entity_col: find_column(&headers, DIPRES_ENTITY_COLUMNS).map(|(i, _)| i),
+        entity_name: find_column(&headers, DIPRES_ENTITY_COLUMNS)
+            .map(|(_, n)| n)
+            .unwrap_or_default(),
+        year_col: find_column(&headers, DIPRES_YEAR_COLUMNS).map(|(i, _)| i),
+        year_name: find_column(&headers, DIPRES_YEAR_COLUMNS)
+            .map(|(_, n)| n)
+            .unwrap_or_default(),
+        amount_col: find_column(&headers, DIPRES_AMOUNT_COLUMNS).map(|(i, _)| i),
+        amount_name: find_column(&headers, DIPRES_AMOUNT_COLUMNS)
+            .map(|(_, n)| n)
+            .unwrap_or_default(),
+        category_col: find_column(&headers, DIPRES_CATEGORY_COLUMNS).map(|(i, _)| i),
+        category_name: find_column(&headers, DIPRES_CATEGORY_COLUMNS)
+            .map(|(_, n)| n)
+            .unwrap_or_default(),
+    };
+
+    println!("\nColumn mapping:");
+    println!("  Entity:   {} -> {:?}", mapping.entity_name, mapping.entity_col);
+    println!("  Year:     {} -> {:?}", mapping.year_name, mapping.year_col);
+    println!("  Amount:   {} -> {:?}", mapping.amount_name, mapping.amount_col);
+    println!("  Category: {} -> {:?}", mapping.category_name, mapping.category_col);
+
+    // Validate required columns
+    let entity_col = mapping.entity_col.context(
+        "AMBIGUITY: No entity column found. Expected one of: partida, capitulo, programa, servicio, organismo"
+    )?;
+    let amount_col = mapping.amount_col.context(
+        "AMBIGUITY: No amount column found. Expected one of: monto, presupuesto, ppto_inicial, ley_inicial, total"
+    )?;
+
+    // Year column is optional - we may use a fixed year from source_id
+    let fixed_year: Option<i32> = if mapping.year_col.is_none() {
+        // Try to extract year from source_id (e.g., "dipres-presupuesto-ley-2024")
+        source_id
+            .split('-')
+            .filter_map(|s| s.parse::<i32>().ok())
+            .find(|&y| y >= 2000 && y <= 2100)
+    } else {
+        None
+    };
+
+    if mapping.year_col.is_none() && fixed_year.is_none() {
+        anyhow::bail!(
+            "AMBIGUITY: No year column found and cannot extract year from source_id '{}'",
+            source_id
+        );
+    }
+
+    println!("\nParsing data rows...");
+
+    let mut facts = Vec::new();
+    let mut skipped = 0;
+
+    // Iterate over data rows (skip header)
+    for (row_idx, row) in range.rows().enumerate().skip(1) {
+        // Extract entity
+        let entity = match row.get(entity_col) {
+            Some(Data::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // Extract year
+        let year: i32 = if let Some(year_col) = mapping.year_col {
+            match row.get(year_col) {
+                Some(Data::Float(f)) => *f as i32,
+                Some(Data::Int(i)) => *i as i32,
+                Some(Data::String(s)) => s.trim().parse().unwrap_or(0),
+                _ => fixed_year.unwrap_or(0),
+            }
+        } else {
+            fixed_year.unwrap_or(0)
+        };
+
+        if year < 2000 || year > 2100 {
+            skipped += 1;
+            continue;
+        }
+
+        // Extract amount
+        let amount: f64 = match row.get(amount_col) {
+            Some(Data::Float(f)) => *f,
+            Some(Data::Int(i)) => *i as f64,
+            Some(Data::String(s)) => s.trim().replace(",", "").replace(".", "").parse().unwrap_or(0.0),
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        if amount == 0.0 {
+            skipped += 1;
+            continue;
+        }
+
+        // Extract category (optional)
+        let category: Option<String> = mapping.category_col.and_then(|col| {
+            match row.get(col) {
+                Some(Data::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                _ => None,
+            }
+        });
+
+        // Normalize entity key (deterministic)
+        let entity_key = entity
+            .to_lowercase()
+            .replace(' ', "_")
+            .replace(".", "")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>();
+
+        // Create period dates
+        let period_start = NaiveDate::from_ymd_opt(year, 1, 1)
+            .context("Invalid year for period_start")?;
+        let period_end = NaiveDate::from_ymd_opt(year, 12, 31)
+            .context("Invalid year for period_end")?;
+
+        // Build dimensions
+        let dims = match &category {
+            Some(cat) => serde_json::json!({ "category": cat }),
+            None => serde_json::json!({}),
+        };
+
+        // Determine metric based on source
+        let (metric_key, metric_name) = if source_id.contains("presupuesto") {
+            ("presupuesto_ley", "Presupuesto de Ley")
+        } else if source_id.contains("gasto") {
+            ("gasto_ejecutado", "Gasto Ejecutado")
+        } else {
+            ("monto", "Monto")
+        };
+
+        facts.push(ParsedFact {
+            entity_key,
+            entity_name: entity,
+            entity_type: "organismo".to_string(),
+            metric_key: metric_key.to_string(),
+            metric_name: metric_name.to_string(),
+            metric_unit: "CLP".to_string(),
+            period_start,
+            period_end,
+            value_num: amount,
+            location: format!("xls:sheet='{}':row={}", sheet_name, row_idx + 1),
+            dims,
+        });
+    }
+
+    println!("Parsed {} facts, skipped {} rows", facts.len(), skipped);
+
+    if facts.is_empty() {
+        anyhow::bail!("No facts parsed from XLS file - check column mapping");
+    }
+
+    Ok(facts)
+}
+
+/// Detect if file is XLS/XLSX based on mime type or file signature
+fn is_excel_file(mime_type: &str, storage_path: &str) -> bool {
+    mime_type.contains("excel")
+        || mime_type.contains("spreadsheet")
+        || storage_path.ends_with(".xls")
+        || storage_path.ends_with(".xlsx")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -375,18 +636,25 @@ async fn main() -> Result<()> {
     };
 
     let result = async {
-        // Read raw content
+        // Detect file format and parse accordingly
         println!("Reading raw file: {}", artifact.storage_path);
-        let content = fs::read_to_string(&artifact.storage_path)
-            .await
-            .context("Failed to read artifact file")?;
+        println!("MIME type: {}", artifact.mime_type);
 
-        println!("Content size: {} bytes", content.len());
+        let facts = if is_excel_file(&artifact.mime_type, &artifact.storage_path) {
+            // Parse as Excel (XLS/XLSX)
+            println!("\nDetected Excel format - using DIPRES XLS parser");
+            parse_dipres_xls(Path::new(&artifact.storage_path), &artifact.source_id)?
+        } else {
+            // Parse as CSV (default)
+            let content = fs::read_to_string(&artifact.storage_path)
+                .await
+                .context("Failed to read artifact file")?;
+            println!("Content size: {} bytes", content.len());
+            println!("Parsing CSV...");
+            parse_csv(&content, &artifact.source_id)?
+        };
 
-        // Parse CSV
-        println!("Parsing CSV...");
-        let facts = parse_csv(&content, &artifact.source_id)?;
-        println!("Parsed {} facts", facts.len());
+        println!("\nParsed {} facts total", facts.len());
 
         if facts.is_empty() {
             anyhow::bail!("No facts parsed from artifact");
