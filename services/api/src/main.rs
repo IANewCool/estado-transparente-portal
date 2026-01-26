@@ -121,6 +121,29 @@ struct ErrorResponse {
     error: String,
 }
 
+// Dashboard response types
+#[derive(Serialize)]
+struct DashboardResponse {
+    year: i32,
+    total_budget: i64,
+    total_formatted: String,
+    previous_year: Option<i32>,
+    previous_total: Option<i64>,
+    yoy_change_pct: Option<f64>,
+    entities: Vec<DashboardEntity>,
+    available_years: Vec<i32>,
+}
+
+#[derive(Serialize)]
+struct DashboardEntity {
+    entity_id: Uuid,
+    entity_key: String,
+    display_name: String,
+    budget: i64,
+    budget_formatted: String,
+    percentage: f64,
+}
+
 // ============================================================================
 // Query params
 // ============================================================================
@@ -149,6 +172,11 @@ struct CompareQuery {
 }
 
 #[derive(Deserialize)]
+struct DashboardQuery {
+    year: Option<i32>,
+}
+
+#[derive(Deserialize)]
 struct EvidenceQuery {
     fact_id: Uuid,
 }
@@ -162,6 +190,162 @@ async fn health_handler() -> Json<HealthResponse> {
         ok: true,
         version: "0.1.0",
     })
+}
+
+async fn dashboard_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<DashboardQuery>,
+) -> impl IntoResponse {
+    // Get available years
+    let years_result: Result<Vec<(i32,)>, _> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT EXTRACT(YEAR FROM period_start)::int as year
+        FROM facts
+        ORDER BY year DESC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await;
+
+    let available_years: Vec<i32> = match years_result {
+        Ok(rows) => rows.into_iter().map(|(y,)| y).collect(),
+        Err(_) => vec![],
+    };
+
+    if available_years.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "No data available".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Default to most recent year
+    let year = params.year.unwrap_or_else(|| available_years[0]);
+    let previous_year = if available_years.contains(&(year - 1)) {
+        Some(year - 1)
+    } else {
+        None
+    };
+
+    // Get entities with budget for selected year
+    let entities_result: Result<Vec<_>, _> = sqlx::query(
+        r#"
+        SELECT
+            e.entity_id,
+            e.entity_key,
+            e.display_name,
+            f.value_num as budget
+        FROM facts f
+        JOIN entities e ON f.entity_id = e.entity_id
+        JOIN metrics m ON f.metric_id = m.metric_id
+        WHERE m.metric_key = 'presupuesto_ley'
+          AND EXTRACT(YEAR FROM f.period_start) = $1
+        ORDER BY f.value_num DESC
+        "#,
+    )
+    .bind(year)
+    .fetch_all(&state.pool)
+    .await;
+
+    let entities = match entities_result {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    use sqlx::Row;
+
+    // Calculate total (value_num is stored as FLOAT8 in PostgreSQL)
+    let total_budget: i64 = entities
+        .iter()
+        .map(|r| r.get::<f64, _>("budget") as i64)
+        .sum();
+
+    // Get previous year total if available
+    let previous_total: Option<i64> = if let Some(prev_year) = previous_year {
+        let prev_result: Result<Option<(i64,)>, _> = sqlx::query_as(
+            r#"
+            SELECT SUM(f.value_num)::bigint as total
+            FROM facts f
+            JOIN metrics m ON f.metric_id = m.metric_id
+            WHERE m.metric_key = 'presupuesto_ley'
+              AND EXTRACT(YEAR FROM f.period_start) = $1
+            "#,
+        )
+        .bind(prev_year)
+        .fetch_optional(&state.pool)
+        .await;
+
+        prev_result.ok().flatten().map(|(t,)| t)
+    } else {
+        None
+    };
+
+    // Calculate YoY change
+    let yoy_change_pct = match (previous_total, total_budget) {
+        (Some(prev), total) if prev > 0 => {
+            Some(((total - prev) as f64 / prev as f64) * 100.0)
+        }
+        _ => None,
+    };
+
+    // Format total for display
+    let total_formatted = format_clp(total_budget);
+
+    // Build entity list with percentages
+    let dashboard_entities: Vec<DashboardEntity> = entities
+        .iter()
+        .map(|r| {
+            let budget: i64 = r.get::<f64, _>("budget") as i64;
+            let percentage = if total_budget > 0 {
+                (budget as f64 / total_budget as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            DashboardEntity {
+                entity_id: r.get("entity_id"),
+                entity_key: r.get("entity_key"),
+                display_name: r.get("display_name"),
+                budget,
+                budget_formatted: format_clp(budget),
+                percentage,
+            }
+        })
+        .collect();
+
+    Json(DashboardResponse {
+        year,
+        total_budget,
+        total_formatted,
+        previous_year,
+        previous_total,
+        yoy_change_pct,
+        entities: dashboard_entities,
+        available_years,
+    })
+    .into_response()
+}
+
+/// Format number as Chilean pesos
+fn format_clp(amount: i64) -> String {
+    let billions = amount as f64 / 1_000_000_000_000.0;
+    if billions >= 1.0 {
+        format!("${:.2} billones", billions)
+    } else {
+        let millions = amount as f64 / 1_000_000_000.0;
+        format!("${:.1} mil millones", millions)
+    }
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -553,6 +737,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/dashboard", get(dashboard_handler))
         .route("/metrics", get(metrics_handler))
         .route("/entities", get(entities_handler))
         .route("/facts", get(facts_handler))
