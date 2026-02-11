@@ -26,10 +26,12 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs;
 use tokio::time::sleep;
+use url::Url;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
@@ -165,6 +167,71 @@ impl Config {
     }
 }
 
+// =============================================================================
+// URL Validation (SSRF Prevention)
+// =============================================================================
+
+/// Allowlist of government domains this collector is permitted to fetch from.
+const ALLOWED_DOMAINS: &[&str] = &[
+    "www.dipres.gob.cl",
+    "dipres.gob.cl",
+    "datos.gob.cl",
+    "www.contraloria.cl",
+    "www.bcn.cl",
+];
+
+/// Validate a URL against the allowlist to prevent SSRF attacks.
+///
+/// Rules enforced:
+/// - Only HTTPS scheme is allowed
+/// - Host must not be a raw IP address
+/// - Host must match one of the entries in `ALLOWED_DOMAINS`
+fn validate_url(raw_url: &str) -> Result<()> {
+    let parsed = Url::parse(raw_url).context("Invalid URL")?;
+
+    // Block non-HTTPS schemes
+    if parsed.scheme() != "https" {
+        anyhow::bail!(
+            "URL scheme '{}' is not allowed; only HTTPS is permitted: {}",
+            parsed.scheme(),
+            raw_url
+        );
+    }
+
+    // Extract host (reject URLs with no host, e.g. file:// or data:)
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("URL has no host: {}", raw_url))?;
+
+    // Block raw IP addresses (IPv4 and IPv6)
+    if host.parse::<IpAddr>().is_ok() {
+        anyhow::bail!(
+            "Direct IP addresses are not allowed (SSRF protection): {}",
+            raw_url
+        );
+    }
+
+    // Also catch bracketed IPv6 (url crate strips brackets in host_str,
+    // but guard against edge cases by checking the Host enum directly)
+    if let Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) = parsed.host() {
+        anyhow::bail!(
+            "Direct IP addresses are not allowed (SSRF protection): {}",
+            raw_url
+        );
+    }
+
+    // Validate against domain allowlist
+    if !ALLOWED_DOMAINS.iter().any(|&d| d == host) {
+        anyhow::bail!(
+            "Domain '{}' is not in the allowed domains list. Allowed: {:?}",
+            host,
+            ALLOWED_DOMAINS
+        );
+    }
+
+    Ok(())
+}
+
 /// Check if artifact with same hash already exists
 async fn check_existing_artifact(pool: &PgPool, content_hash: &str) -> Result<Option<Uuid>> {
     let row: Option<(Uuid,)> = sqlx::query_as(
@@ -274,6 +341,9 @@ async fn fetch_url(
     force: bool,
     dry_run: bool,
 ) -> Result<Uuid> {
+    // Validate URL against allowlist before any network activity (SSRF prevention)
+    validate_url(url)?;
+
     // Rate limit: wait before request
     println!("  Rate limit: waiting {}ms...", config.rate_limit_ms);
     sleep(Duration::from_millis(config.rate_limit_ms)).await;
@@ -375,8 +445,11 @@ async fn main() -> Result<()> {
     println!("Storage: {}", config.raw_store);
 
     // Build HTTP client
+    // redirect(Policy::none()) prevents redirect-based SSRF bypass where an allowed
+    // domain redirects to an internal/disallowed host.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("EstadoTransparente/1.0 (portal ciudadano independiente; contacto@estadotransparente.cl)")
         .build()?;
 
